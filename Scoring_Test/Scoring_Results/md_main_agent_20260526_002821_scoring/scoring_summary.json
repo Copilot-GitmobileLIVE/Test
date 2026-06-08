@@ -1,0 +1,14 @@
+{
+  "evaluated_agent_name": "MD_Main_Agent",
+  "evaluated_at": "2026-05-26T00:28:21.113254+00:00",
+  "score": null,
+  "passed": null,
+  "rubric_maximums": {
+    "task_fit": 2,
+    "correctness_and_completeness": 4,
+    "reasoning_and_evidence": 2,
+    "markdown_or_packaging_quality": 1,
+    "safety_and_limitations_handling": 1
+  },
+  "rationale": ""
+}

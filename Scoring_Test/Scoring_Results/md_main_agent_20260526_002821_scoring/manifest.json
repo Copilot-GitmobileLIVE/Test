@@ -1,0 +1,11 @@
+{
+  "evaluated_agent_name": "MD_Main_Agent",
+  "scoring_folder": "Scoring_Test\\Scoring_Results\\md_main_agent_20260526_002821_scoring",
+  "created_at": "2026-05-26T00:28:21.113254+00:00",
+  "task_summary": "",
+  "expected_files": [
+    "manifest.json",
+    "scoring_summary.json",
+    "scoring_notes.md"
+  ]
+}
