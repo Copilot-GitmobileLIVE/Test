@@ -2,7 +2,7 @@
 write a results CSV with the real answer, tools called, and evaluation scores.
 
 Example:
-    python agent_trace_table_3.py --test-data test_data.csv --agent-name "Web Q&A Agent"
+
     python agent_trace_table_3.py --test-data test_data.csv  # uses Web Q&A Agent by default
     python agent_trace_table_3.py --test-data test_data.csv --no-eval  # skip evaluation
 
@@ -34,6 +34,37 @@ try:
     DEEPEVAL_AVAILABLE = True
 except ImportError:  # pragma: no cover
     DEEPEVAL_AVAILABLE = False
+
+# Optional sentence-transformers for semantic similarity — install with: pip install sentence-transformers
+try:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    np = None  # type: ignore[assignment]
+
+# Optional sklearn for TF-IDF cosine similarity fallback — install with: pip install scikit-learn
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_similarity
+    SKLEARN_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    SKLEARN_AVAILABLE = False
+
+# Optional NLTK for BLEU score — install with: pip install nltk
+try:
+    from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+    NLTK_BLEU_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    NLTK_BLEU_AVAILABLE = False
+
+# Optional rouge-score for ROUGE metrics — install with: pip install rouge-score
+try:
+    from rouge_score import rouge_scorer as rouge_scorer_lib
+    ROUGE_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    ROUGE_AVAILABLE = False
 
 
 @dataclass
@@ -568,8 +599,14 @@ class EvaluationPipeline:
         self._relevance_metric: Any = None
         self._groundedness_metric: Any = None
         self._hallucination_metric: Any = None
+        self._st_model: Any = None
         if self.use_deepeval:
             self._init_metrics()
+        if SENTENCE_TRANSFORMERS_AVAILABLE:
+            try:
+                self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
+            except Exception:
+                self._st_model = None
 
     def _init_metrics(self) -> None:
         self._relevance_metric = AnswerRelevancyMetric(
@@ -715,6 +752,72 @@ class EvaluationPipeline:
     # Aggregate evaluation
     # ------------------------------------------------------------------
 
+    def compute_semantic_similarity(self, expected: str, actual: str) -> float:
+        """Compute semantic similarity between *expected* and *actual* answer (0–1).
+
+        Uses sentence-transformers cosine similarity when available, falls back
+        to TF-IDF cosine similarity (sklearn), and finally to word-overlap.
+        """
+        if not expected or not actual or actual == "(answer not captured)":
+            return 0.0
+
+        if self._st_model is not None and np is not None:
+            try:
+                emb = self._st_model.encode([expected, actual])
+                norm_a = np.linalg.norm(emb[0])
+                norm_b = np.linalg.norm(emb[1])
+                if norm_a > 0 and norm_b > 0:
+                    sim = float(np.dot(emb[0], emb[1]) / (norm_a * norm_b))
+                    return max(0.0, min(1.0, sim))
+            except Exception:
+                pass
+
+        if SKLEARN_AVAILABLE:
+            try:
+                vect = TfidfVectorizer()
+                tfidf = vect.fit_transform([expected, actual])
+                sim = float(sklearn_cosine_similarity(tfidf[0], tfidf[1])[0][0])
+                return max(0.0, min(1.0, sim))
+            except Exception:
+                pass
+
+        return self._word_overlap(expected, actual)
+
+    def compute_bleu_rouge(self, expected: str, actual: str) -> float:
+        """Compute a combined BLEU / ROUGE-L score between *expected* and *actual* (0–1).
+
+        Averages BLEU-1 (nltk) and ROUGE-L F1 (rouge-score) when both libraries
+        are available.  Falls back to whichever is available, or to simple
+        word-overlap when neither is installed.
+        """
+        if not expected or not actual or actual == "(answer not captured)":
+            return 0.0
+
+        scores: list[float] = []
+
+        if NLTK_BLEU_AVAILABLE:
+            try:
+                ref = [expected.lower().split()]
+                hyp = actual.lower().split()
+                sf = SmoothingFunction().method1
+                bleu = float(sentence_bleu(ref, hyp, smoothing_function=sf))
+                scores.append(max(0.0, min(1.0, bleu)))
+            except Exception:
+                pass
+
+        if ROUGE_AVAILABLE:
+            try:
+                scorer = rouge_scorer_lib.RougeScorer(["rougeL"], use_stemmer=True)
+                result = scorer.score(expected, actual)
+                rouge_l = float(result["rougeL"].fmeasure)
+                scores.append(max(0.0, min(1.0, rouge_l)))
+            except Exception:
+                pass
+
+        if scores:
+            return round(sum(scores) / len(scores), 4)
+        return self._word_overlap(expected, actual)
+
     def evaluate_row(
         self,
         question: str,
@@ -729,15 +832,28 @@ class EvaluationPipeline:
         groundedness = self.compute_groundedness(question, real_answer, context)
         hallucination = self.compute_hallucination(question, real_answer, context)
         tool_sel = self.compute_tool_selection_correctness(tools_called, expected_tools)
-        avg_score = (relevance + groundedness + (1.0 - hallucination) + tool_sel) / 4.0
+        semantic_sim = self.compute_semantic_similarity(expected_answer, real_answer)
+        bleu_rouge = self.compute_bleu_rouge(expected_answer, real_answer)
+        avg_score = (relevance + groundedness + (1.0 - hallucination) + tool_sel + semantic_sim + bleu_rouge) / 6.0
+
+        # Scale all 0-1 scores to the 1-100 range
+        relevance_scaled = self._to_100_scale(relevance)
+        groundedness_scaled = self._to_100_scale(groundedness)
+        hallucination_scaled = self._to_100_scale(hallucination)
+        tool_sel_scaled = self._to_100_scale(tool_sel)
+        semantic_sim_scaled = self._to_100_scale(semantic_sim)
+        bleu_rouge_scaled = self._to_100_scale(bleu_rouge)
+        avg_score_scaled = self._to_100_scale(avg_score)
 
         eval_summary = json.dumps(
             {
-                "relevance": round(relevance, 4),
-                "groundedness": round(groundedness, 4),
-                "hallucination": round(hallucination, 4),
-                "tool_selection_correctness": round(tool_sel, 4),
-                "avg_score": round(avg_score, 4),
+                "relevance": relevance_scaled,
+                "groundedness": groundedness_scaled,
+                "hallucination": hallucination_scaled,
+                "tool_selection_correctness": tool_sel_scaled,
+                "semantic_similarity": semantic_sim_scaled,
+                "bleu_rouge_score": bleu_rouge_scaled,
+                "avg_score": avg_score_scaled,
                 "evaluator": "deepeval" if self.use_deepeval else "heuristic",
             },
             ensure_ascii=False,
@@ -748,16 +864,23 @@ class EvaluationPipeline:
             "expected_answer": expected_answer,
             "real_answer": real_answer,
             "tools_called": tools_called,
-            "relevance_score": round(relevance, 4),
-            "groundedness_score": round(groundedness, 4),
-            "hallucination": round(hallucination, 4),
-            "tool_selection_correctness": round(tool_sel, 4),
+            "relevance_score": relevance_scaled,
+            "groundedness_score": groundedness_scaled,
+            "hallucination": hallucination_scaled,
+            "tool_selection_correctness": tool_sel_scaled,
+            "semantic_similarity": semantic_sim_scaled,
+            "bleu_rouge_score": bleu_rouge_scaled,
             "eval_result": eval_summary,
         }
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_100_scale(score: float) -> float:
+        """Map a 0–1 score to the 1–100 scale (0 → 1, 1 → 100)."""
+        return round(1.0 + float(score) * 99.0, 2)
 
     @staticmethod
     def _word_overlap(reference: str, hypothesis: str) -> float:
@@ -1030,6 +1153,8 @@ def main() -> int:
         "groundedness_score",
         "hallucination",
         "tool_selection_correctness",
+        "semantic_similarity",
+        "bleu_rouge_score",
         "eval_result",
     ]
 
@@ -1066,6 +1191,8 @@ def main() -> int:
                 f"  groundedness={record['groundedness_score']}"
                 f"  hallucination={record['hallucination']}"
                 f"  tool_selection={record['tool_selection_correctness']}"
+                f"  semantic_sim={record['semantic_similarity']}"
+                f"  bleu_rouge={record['bleu_rouge_score']}"
             )
         else:
             record = {
@@ -1077,6 +1204,8 @@ def main() -> int:
                 "groundedness_score": "",
                 "hallucination": "",
                 "tool_selection_correctness": "",
+                "semantic_similarity": "",
+                "bleu_rouge_score": "",
                 "eval_result": "",
             }
         print()
